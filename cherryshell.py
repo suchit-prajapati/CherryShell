@@ -1,4 +1,5 @@
 """CherryShell - a small PowerShell-style shell with an object pipeline."""
+import glob
 import os
 import re
 import shutil
@@ -97,6 +98,7 @@ class Shell:
         self.vars = {"true": True, "false": False, "null": None,
                      "home": os.path.expanduser("~"), "pid": os.getpid()}
         self.running = True
+        self.history = []
         self.commands = {
             "get-childitem": self.get_childitem, "get-location": self.get_location,
             "set-location": self.set_location, "where-object": self.where_object,
@@ -107,6 +109,8 @@ class Shell:
             "get-variable": self.get_variable, "get-command": self.get_command,
             "format-table": self.format_table_cmd, "clear-host": self.clear_host,
             "exit": self.exit, "new-item": self.new_item, "remove-item": self.remove_item,
+            "copy-item": self.copy_item, "move-item": self.move_item,
+            "rename-item": self.rename_item, "get-history": self.get_history,
         }
         self.aliases = {
             "ls": "get-childitem", "dir": "get-childitem", "gci": "get-childitem",
@@ -117,6 +121,10 @@ class Shell:
             "ps": "get-process", "gcm": "get-command", "ft": "format-table",
             "cls": "clear-host", "clear": "clear-host", "quit": "exit",
             "mkdir": "new-item", "rm": "remove-item", "del": "remove-item",
+            "cp": "copy-item", "copy": "copy-item", "cpi": "copy-item",
+            "mv": "move-item", "move": "move-item", "mi": "move-item",
+            "ren": "rename-item", "rni": "rename-item",
+            "history": "get-history", "h": "get-history",
         }
 
     # ---- evaluation helpers
@@ -366,6 +374,58 @@ class Shell:
                 os.remove(t)
         return []
 
+    def _sources_and_dest(self, pos, named, pipe):
+        dest = named.get("destination")
+        paths = [named["path"]] if "path" in named else list(pos)
+        if dest is None:
+            if len(paths) < 2:
+                raise ShellError("usage: <command> <source> <destination>")
+            dest = paths.pop()
+        if not paths:
+            paths = [get_prop(x, "Name") for x in pipe]
+        sources = []
+        for p in paths:
+            matches = glob.glob(str(p))
+            if not matches:
+                raise ShellError(f"Cannot find path '{p}' because it does not exist.")
+            sources.extend(matches)
+        dest = str(dest)
+        if len(sources) > 1 and not os.path.isdir(dest):
+            raise ShellError(f"Destination '{dest}' must be an existing folder for multiple items.")
+        return sources, dest
+
+    def copy_item(self, pos, named, pipe):
+        sources, dest = self._sources_and_dest(pos, named, pipe)
+        for src in sources:
+            target = os.path.join(dest, os.path.basename(src)) if os.path.isdir(dest) else dest
+            if os.path.isdir(src):
+                if not named.get("recurse"):
+                    raise ShellError(f"'{src}' is a folder; use -Recurse to copy it.")
+                shutil.copytree(src, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, target)
+        return []
+
+    def move_item(self, pos, named, pipe):
+        sources, dest = self._sources_and_dest(pos, named, pipe)
+        for src in sources:
+            shutil.move(src, dest)
+        return []
+
+    def rename_item(self, pos, named, pipe):
+        path = named.get("path", pos[0] if pos else None)
+        new = named.get("newname", pos[1] if len(pos) > 1 else None)
+        if path is None or new is None:
+            raise ShellError("usage: Rename-Item <path> <new name>")
+        if not os.path.exists(path):
+            raise ShellError(f"Cannot find path '{path}' because it does not exist.")
+        os.rename(path, os.path.join(os.path.dirname(str(path)), str(new)))
+        return []
+
+    def get_history(self, pos, named, pipe):
+        for i, line in enumerate(self.history, 1):
+            yield Obj(Id=i, CommandLine=line)
+
 
 class ShellError(Exception):
     pass
@@ -373,8 +433,11 @@ class ShellError(Exception):
 
 # --------------------------------------------------------------- helpers
 
+_WORDS = {"childitem": "ChildItem", "foreach": "ForEach"}
+
+
 def _title(name):
-    return "-".join(p.capitalize() for p in name.split("-"))
+    return "-".join(_WORDS.get(p, p.capitalize()) for p in name.split("-"))
 
 
 def _like(value, pattern):
@@ -442,6 +505,43 @@ def output(items):
 # ---------------------------------------------------------------- main
 
 RED, CHERRY, RESET = "\033[91m", "\033[38;5;161m", "\033[0m"
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".cherryshell_history")
+
+
+def make_reader(shell):
+    """Line editor with persistent history and Tab completion; plain input() as fallback."""
+    if not sys.stdin.isatty():
+        return input
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.formatted_text import ANSI
+        from prompt_toolkit.history import FileHistory
+        session = PromptSession(history=FileHistory(HISTORY_FILE), completer=make_completer(shell),
+                                complete_while_typing=False)
+    except Exception:  # not installed, or not a real console (e.g. Git Bash/mintty)
+        return input
+    return lambda prompt: session.prompt(ANSI(prompt))
+
+
+def make_completer(shell):
+    from prompt_toolkit.completion import Completer, Completion, PathCompleter
+    from prompt_toolkit.document import Document
+
+    class ShellCompleter(Completer):
+        paths = PathCompleter(expanduser=True)
+
+        def get_completions(self, document, event):
+            segment = re.split(r"[|;]", document.text_before_cursor)[-1].lstrip()
+            if " " not in segment:
+                names = [_title(c) for c in shell.commands] + list(shell.aliases)
+                for name in sorted(names, key=str.lower):
+                    if name.lower().startswith(segment.lower()):
+                        yield Completion(name, start_position=-len(segment))
+                return
+            word = segment.rsplit(" ", 1)[-1].strip("\"'")
+            yield from self.paths.get_completions(Document(word, len(word)), event)
+
+    return ShellCompleter()
 
 
 def main():
@@ -456,13 +556,18 @@ def main():
             for line in f:
                 shell.run_line(line)
         return
-    print(f"{CHERRY}CherryShell 0.1{RESET} - type Get-Command for commands, exit to quit.\n")
+    print(f"{CHERRY}CherryShell 0.2{RESET} - type Get-Command for commands, exit to quit.\n")
+    read_line = make_reader(shell)
     while shell.running:
         try:
-            line = input(f"{CHERRY}CS{RESET} {os.getcwd()}> ")
-        except (EOFError, KeyboardInterrupt):
+            line = read_line(f"{CHERRY}CS{RESET} {os.getcwd()}> ")
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
             print()
             break
+        if line.strip():
+            shell.history.append(line.strip())
         try:
             shell.run_line(line)
         except ShellError as e:

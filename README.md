@@ -16,11 +16,11 @@ python cherryshell.py            # interactive
 python cherryshell.py script.cherry
 ```
 
-Type `Get-Command` to list built-in commands. Anything else (git, pip, winget, ...) runs as an external program with live output.
+Type `Get-Command` to list built-in commands. Press Tab to complete command names and paths; Up/Down arrows browse history (saved in `~/.cherryshell_history`, also `Get-History`). Anything else (git, pip, winget, ...) runs as an external program with live output.
 
 ## Build the Windows installer
 
-Needs PyInstaller (`pip install pyinstaller`) and Inno Setup (`winget install JRSoftware.InnoSetup`).
+Needs PyInstaller and prompt_toolkit (`pip install pyinstaller prompt_toolkit`) and Inno Setup (`winget install JRSoftware.InnoSetup`).
 
 ```
 build.bat
