@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-PackageIdentifier: SuchitPrajapati.CherryShell
+PackageIdentifier: CherryShell.CherryShell
 PackageVersion: "0.2"
 InstallerType: inno
 Scope: user
