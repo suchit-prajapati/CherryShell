@@ -1,7 +1,10 @@
 ; Inno Setup script for CherryShell. Build with build.bat.
 
 #define AppName "CherryShell"
-#define AppVersion "0.2"
+; AppVersion is passed in by build.bat (/DAppVersion=...) from cherryshell.__version__
+#ifndef AppVersion
+  #error Build with build.bat so AppVersion is set
+#endif
 
 [Setup]
 AppId={{6C1E2A4F-8B3D-4E7A-9C51-3F2D8A6B1C07}

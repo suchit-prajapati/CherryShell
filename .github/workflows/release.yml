@@ -1,0 +1,64 @@
+name: Build installer
+
+# Push a tag like v0.3 to build CherryShell-Setup.exe and attach it to that
+# GitHub release (created if missing). Run manually to just build and download.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller prompt_toolkit
+          choco install innosetup -y --no-progress
+
+      - name: Check tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(python -c "import cherryshell; print(cherryshell.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $version in cherryshell.py"
+            exit 1
+          fi
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Checksum
+        shell: bash
+        run: cd dist && sha256sum CherryShell-Setup.exe > CherryShell-Setup.exe.sha256 && cat CherryShell-Setup.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CherryShell-Setup
+          path: |
+            dist/CherryShell-Setup.exe
+            dist/CherryShell-Setup.exe.sha256
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "CherryShell $GITHUB_REF_NAME" --generate-notes
+          fi
+          # No --clobber: replacing a published installer would break its winget hash.
+          gh release upload "$GITHUB_REF_NAME" dist/CherryShell-Setup.exe dist/CherryShell-Setup.exe.sha256

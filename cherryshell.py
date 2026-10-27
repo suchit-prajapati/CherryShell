@@ -1,4 +1,6 @@
 """CherryShell - a small PowerShell-style shell with an object pipeline."""
+__version__ = "0.2"
+
 import glob
 import os
 import re
@@ -556,7 +558,7 @@ def main():
             for line in f:
                 shell.run_line(line)
         return
-    print(f"{CHERRY}CherryShell 0.2{RESET} - type Get-Command for commands, exit to quit.\n")
+    print(f"{CHERRY}CherryShell {__version__}{RESET} - type Get-Command for commands, exit to quit.\n")
     read_line = make_reader(shell)
     while shell.running:
         try:
