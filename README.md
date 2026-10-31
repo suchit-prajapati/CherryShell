@@ -9,6 +9,33 @@ gci | ? { $_.Length -gt 100 } | measure Length
 $x = "cherry"; echo "hello $x"
 ```
 
+## Scripting
+
+PowerShell-style statements, with Python for the expressions. Use them at the prompt (an open `{` continues on the next line) or in a `.cherry` file run with `cherryshell script.cherry`.
+
+```powershell
+$files = ls | where { $_.Length -gt 0 }
+foreach ($f in $files) { echo "$($f.Name): $($f.Length) bytes" }
+
+if ($x -gt 10) { echo "big" } elseif ($x -ge 5) { echo "medium" } else { echo "small" }
+
+for ($i = 3; $i -gt 0; $i--) { echo "T-minus $i" }
+while ($n -lt 100) { $n += 7; if ($n % 2 -eq 0) { continue }; echo $n }
+
+function greet($who, $times = 1) {
+    foreach ($t in 1..$times) { echo "Hello $who" }
+}
+greet "World" -times 2
+
+function fact($n) { if ($n -le 1) { return 1 }; return $n * (fact ($n - 1)) }
+echo "5! = $(fact 5)"
+```
+
+- Operators: `-eq -ne -gt -ge -lt -le -like -notlike -match -notmatch -contains -in -and -or -not`, ranges `1..10`, `++ -- += -= *= /=`.
+- Anything else in an expression is Python: `math.sqrt($x)`, `len($list)`, `$name.upper()`, `[1, 2, 3]`. A comma list needs brackets after `-in`: `"a" -in ("a", "b")`.
+- Functions return everything they output; `$args` holds extra arguments and `$input` the pipeline input. Variables set inside a function stay local.
+- Also: `break`, `continue`, `return`, `exit`, `Test-Path`, `Read-Host`, `Start-Sleep`, `Get-Function`.
+
 ## Python in the pipeline
 
 CherryShell runs on Python, so Python is part of the shell. `py` evaluates an expression where `_` is the list of pipeline items (or one item at a time with `-Each`). Modules like `math`, `json` or `statistics` are imported automatically.

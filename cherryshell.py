@@ -74,12 +74,9 @@ def tokenize(line):
                 j += 1
             tokens.append(("str" if c == "'" else "dstr", line[i + 1:j]))
             i = j + 1
-        elif c == "{":
-            depth, j = 1, i + 1
-            while j < n and depth:
-                depth += {"{": 1, "}": -1}.get(line[j], 0)
-                j += 1
-            tokens.append(("block", line[i + 1:j - 1].strip()))
+        elif c in "{(":
+            j = scan_balanced(line, i)
+            tokens.append(("block" if c == "{" else "paren", line[i + 1:j - 1].strip()))
             i = j
         else:
             j = i
@@ -92,6 +89,63 @@ def tokenize(line):
     return tokens
 
 
+CLOSERS = {"{": "}", "(": ")", "[": "]"}
+
+
+def scan_balanced(text, i):
+    """text[i] is an opening bracket; return the index just past its match (quote-aware)."""
+    stack, j, n = [], i, len(text)
+    while j < n:
+        c = text[j]
+        if c in "\"'":
+            j = text.find(c, j + 1)
+            if j < 0:
+                return n
+        elif c == "#" and (j == 0 or text[j - 1] in " \t\n;{"):
+            j = text.find("\n", j)
+            if j < 0:
+                return n
+            continue
+        elif c in CLOSERS:
+            stack.append(CLOSERS[c])
+        elif stack and c == stack[-1]:
+            stack.pop()
+            if not stack:
+                return j + 1
+        j += 1
+    return n
+
+
+def is_incomplete(text):
+    """True while a typed block still has an open bracket or quote, so the REPL asks for more."""
+    depth, j, n = 0, 0, len(text)
+    while j < n:
+        c = text[j]
+        if c in "\"'":
+            j = text.find(c, j + 1)
+            if j < 0:
+                return True
+        elif c == "#" and (j == 0 or text[j - 1] in " \t\n;{"):
+            j = text.find("\n", j)
+            if j < 0:
+                break
+            continue
+        elif c in CLOSERS:
+            depth += 1
+        elif c in ")}]":
+            depth -= 1
+        j += 1
+    return depth > 0
+
+
+def tokens_to_text(tokens):
+    parts = []
+    for kind, text in tokens:
+        parts.append({"str": f"'{text}'", "dstr": f'"{text}"', "block": "{" + text + "}",
+                      "paren": f"({text})"}.get(kind, text))
+    return " ".join(parts)
+
+
 def split_on(tokens, op):
     parts, cur = [], []
     for t in tokens:
@@ -102,6 +156,223 @@ def split_on(tokens, op):
             cur.append(t)
     parts.append(cur)
     return parts
+
+
+# ---------------------------------------------------------------- scripting
+
+class ReturnSignal(Exception):
+    def __init__(self, items):
+        self.items = items
+
+
+class BreakSignal(Exception):
+    pass
+
+
+class ContinueSignal(Exception):
+    pass
+
+
+KEYWORDS = ("if", "foreach", "while", "for", "function", "return", "break", "continue")
+
+
+class ScriptParser:
+    """Splits script text into statements. Block bodies stay as text and are parsed when run."""
+
+    def __init__(self, text):
+        self.text, self.i = text, 0
+
+    def error(self, msg):
+        line = self.text.count("\n", 0, self.i) + 1
+        raise ShellError(f"Parse error on line {line}: {msg}")
+
+    def skip(self, newlines=True):
+        while self.i < len(self.text):
+            c = self.text[self.i]
+            if c == "#":
+                end = self.text.find("\n", self.i)
+                self.i = len(self.text) if end < 0 else end
+            elif c in " \t\r" or (newlines and c in "\n;"):
+                self.i += 1
+            else:
+                break
+
+    def keyword(self):
+        m = re.match(r"([A-Za-z]+)(?![\w-])", self.text[self.i:])
+        return m.group(1).lower() if m and m.group(1).lower() in KEYWORDS + ("elseif", "else") else None
+
+    def bracket(self, opener):
+        self.skip()
+        if self.i >= len(self.text) or self.text[self.i] != opener:
+            self.error(f"expected '{opener}'")
+        end = scan_balanced(self.text, self.i)
+        if end > len(self.text) or self.text[end - 1] != CLOSERS[opener]:
+            self.error(f"missing '{CLOSERS[opener]}'")
+        inner, self.i = self.text[self.i + 1:end - 1], end
+        return inner
+
+    def rest_of_statement(self):
+        start, n = self.i, len(self.text)
+        while self.i < n and self.text[self.i] not in "\n;":
+            c = self.text[self.i]
+            if c in CLOSERS or c in "\"'":
+                self.i = scan_balanced(self.text, self.i) if c in CLOSERS else \
+                    (self.text.find(c, self.i + 1) + 1 or n)
+            elif c == "#" and self.text[self.i - 1:self.i] in (" ", "\t", ""):
+                break
+            else:
+                self.i += 1
+        return self.text[start:self.i].strip()
+
+    def statements(self):
+        out = []
+        while True:
+            self.skip()
+            if self.i >= len(self.text):
+                return out
+            out.append(self.statement())
+
+    def statement(self):
+        kw = self.keyword()
+        if kw:
+            self.i += len(kw)
+        if kw == "if":
+            branches = [(self.bracket("("), self.bracket("{"))]
+            otherwise = None
+            while True:
+                save = self.i
+                self.skip()
+                nxt = self.keyword()
+                if nxt == "elseif":
+                    self.i += 6
+                    branches.append((self.bracket("("), self.bracket("{")))
+                elif nxt == "else":
+                    self.i += 4
+                    otherwise = self.bracket("{")
+                    break
+                else:
+                    self.i = save
+                    break
+            return ("if", branches, otherwise)
+        if kw == "foreach":
+            m = re.fullmatch(r"\s*\$(\w+)\s+in\s+(.+)", self.bracket("("), re.S | re.I)
+            if not m:
+                self.error("expected: foreach ($item in <collection>) { ... }")
+            return ("foreach", m.group(1).lower(), m.group(2).strip(), self.bracket("{"))
+        if kw == "while":
+            return ("while", self.bracket("("), self.bracket("{"))
+        if kw == "for":
+            parts = split_top_level(self.bracket("("), ";")
+            if len(parts) != 3:
+                self.error("expected: for (init; condition; step) { ... }")
+            return ("for", *parts, self.bracket("{"))
+        if kw == "function":
+            self.skip()
+            m = re.match(r"[\w-]+", self.text[self.i:])
+            if not m:
+                self.error("expected a function name")
+            name = m.group(0)
+            self.i += len(name)
+            self.skip(newlines=False)
+            params = self.bracket("(") if self.text[self.i:self.i + 1] == "(" else ""
+            body = self.bracket("{")
+            pm = re.match(r"\s*param\s*\(", body, re.I)
+            if pm:  # function f { param($a, $b) ... }
+                end = scan_balanced(body, pm.end() - 1)
+                params, body = body[pm.end():end - 1], body[end:]
+            return ("function", name.lower(), name, parse_params(params), body)
+        if kw in ("return", "break", "continue"):
+            return (kw, self.rest_of_statement())
+        return ("simple", self.rest_of_statement())
+
+
+def split_top_level(text, sep):
+    parts, start, j = [], 0, 0
+    while j < len(text):
+        c = text[j]
+        if c in CLOSERS:
+            j = scan_balanced(text, j)
+            continue
+        if c in "\"'":
+            j = (text.find(c, j + 1) + 1) or len(text)
+            continue
+        if c == sep:
+            parts.append(text[start:j].strip())
+            start = j + 1
+        j += 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def parse_params(text):
+    params = []
+    for part in split_top_level(text, ",") if text.strip() else []:
+        m = re.fullmatch(r"\$(\w+)\s*(?:=\s*(.+))?", part, re.S)
+        if not m:
+            raise ShellError(f"Bad parameter '{part}' (expected $name or $name = default)")
+        params.append((m.group(1).lower(), m.group(2)))
+    return params
+
+
+class _Op:
+    """Infix helper so `a |_LIKE| b` works inside translated expressions."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __ror__(self, left):
+        return _Op(lambda right: self.fn(left, right))
+
+    def __or__(self, right):
+        return self.fn(right)
+
+
+def _ps_range(a, b):
+    a, b = int(a), int(b)
+    return list(range(a, b + 1)) if a <= b else list(range(a, b - 1, -1))
+
+
+EXPR_OPS = [  # PowerShell operator -> Python; longer names first so -notlike wins over -not
+    (r"-notlike\b", " |_NOTLIKE| "), (r"-like\b", " |_LIKE| "),
+    (r"-notmatch\b", " |_NOTMATCH| "), (r"-match\b", " |_MATCH| "),
+    (r"-notcontains\b", " |_NOTCONTAINS| "), (r"-contains\b", " |_CONTAINS| "),
+    (r"-notin\b", " not in "), (r"-in\b", " in "),
+    (r"-eq\b", " == "), (r"-ne\b", " != "), (r"-gt\b", " > "), (r"-ge\b", " >= "),
+    (r"-lt\b", " < "), (r"-le\b", " <= "), (r"-and\b", " and "), (r"-or\b", " or "),
+    (r"-not\b", " not "), (r"!(?!=)", " not "),
+]
+
+EXPR_HELPERS = {
+    "_LIKE": _Op(lambda a, b: _like(a, b)), "_NOTLIKE": _Op(lambda a, b: not _like(a, b)),
+    "_MATCH": _Op(lambda a, b: re.search(str(b), str(a), re.I) is not None),
+    "_NOTMATCH": _Op(lambda a, b: re.search(str(b), str(a), re.I) is None),
+    "_CONTAINS": _Op(lambda a, b: b in a), "_NOTCONTAINS": _Op(lambda a, b: b not in a),
+    "_range": _ps_range,
+}
+
+
+def translate_expr(code):
+    """PowerShell-flavoured expression -> Python source. Strings are kept apart so they are not rewritten."""
+    out, j, n = [], 0, len(code)
+    while j < n:
+        c = code[j]
+        if c in "\"'":
+            end = code.find(c, j + 1)
+            end = n if end < 0 else end
+            body = code[j + 1:end]
+            out.append(f"_s({body!r})" if c == '"' and "$" in body else repr(body))
+            j = end + 1
+            continue
+        k = j
+        while k < n and code[k] not in "\"'":
+            k += 1
+        seg = re.sub(r"\$(\w+)", lambda m: f"_v.get({m.group(1).lower()!r})", code[j:k])
+        seg = re.sub(r"(-?\d+|_v\.get\('\w+'\))\s*\.\.\s*(-?\d+|_v\.get\('\w+'\))", r"_range(\1, \2)", seg)
+        for pat, rep in EXPR_OPS:
+            seg = re.sub(pat, rep, seg, flags=re.I)
+        out.append(seg)
+        j = k
+    return "".join(out)
 
 
 # ------------------------------------------------------------------ shell
@@ -128,6 +399,8 @@ class Shell:
             "exit": self.exit, "new-item": self.new_item, "remove-item": self.remove_item,
             "copy-item": self.copy_item, "move-item": self.move_item,
             "rename-item": self.rename_item, "get-history": self.get_history,
+            "test-path": self.test_path, "read-host": self.read_host, "start-sleep": self.start_sleep,
+            "get-function": self.get_function,
             # Python integration
             "invoke-python": self.invoke_python,
             "convertfrom-csv": self.convertfrom_csv, "convertto-csv": self.convertto_csv,
@@ -150,7 +423,7 @@ class Shell:
             "cp": "copy-item", "copy": "copy-item", "cpi": "copy-item",
             "mv": "move-item", "move": "move-item", "mi": "move-item",
             "ren": "rename-item", "rni": "rename-item",
-            "history": "get-history", "h": "get-history",
+            "history": "get-history", "h": "get-history", "sleep": "start-sleep",
             "py": "invoke-python", "from-csv": "convertfrom-csv", "to-csv": "convertto-csv",
             "from-json": "convertfrom-json", "to-json": "convertto-json",
             "get-json": "invoke-restmethod", "irm": "invoke-restmethod",
@@ -158,12 +431,15 @@ class Shell:
             "on-servers": "invoke-server", "server-status": "get-serverstatus",
         }
         self.py_ns = {}  # persists between `py` calls, so `py "a = 5"` then `py "a * 2"` works
+        self.functions = {}  # name -> (display name, params, body) from `function` statements
+        self.sinks = []  # output collectors; empty means print straight to the console
+        self._parsed = {}  # script text -> statements, so loop bodies are parsed once
 
     # ---- evaluation helpers
 
     def expand(self, text):
         # $_ is left alone so it can reach script blocks and `py` code
-        return re.sub(r"\$(?!_\b)(\w+)", lambda m: str(self.vars.get(m.group(1).lower(), "")), text)
+        return self._interpolate(text, keep_underscore=True)
 
     def value(self, tok):
         kind, text = tok
@@ -173,6 +449,8 @@ class Shell:
             return self.expand(text)
         if kind == "block":
             return ("block", text)
+        if kind == "paren":
+            return self.evaluate(text)
         if text.startswith("$"):
             name, _, attr = text[1:].partition(".")
             v = self.vars.get(name.lower())
@@ -184,14 +462,99 @@ class Shell:
                 pass
         return text
 
-    def eval_block(self, code, item):
-        expr = re.sub(r"\$_\b", "_", code)
-        expr = re.sub(r"\$(\w+)", lambda m: f"_v[{m.group(1).lower()!r}]", expr)
-        for k, v in OPS.items():
-            expr = re.sub(re.escape(k) + r"\b", v, expr, flags=re.I)
-        expr = re.sub(r"(\w+)\s+-like\s+(['\"][^'\"]*['\"])", r"_like(\1, \2)", expr, flags=re.I)
-        env = {"_": item, "_v": self.vars, "_like": _like, "True": True, "False": False}
-        return eval(expr, {"__builtins__": {"len": len, "str": str, "int": int}}, env)
+    def eval_expr(self, code):
+        """Evaluate an expression: PowerShell operators and $variables, otherwise plain Python."""
+        ns = dict(EXPR_HELPERS, _v=self.vars, _s=self._interpolate)
+        code = self._run_command_groups(code, ns)
+        src = translate_expr(code)
+        _auto_import(src, ns, "eval")
+        try:
+            return eval(src, ns)
+        except SyntaxError:
+            raise ShellError(f"Invalid expression: {code}")
+
+    def _run_command_groups(self, code, ns):
+        """In `$n * (fact ($n - 1))`, run the bracketed command and use its result as a value."""
+        out, j, n = [], 0, len(code)
+        while j < n:
+            c = code[j]
+            if c in "\"'":
+                end = code.find(c, j + 1)
+                end = n if end < 0 else end + 1
+                out.append(code[j:end])
+                j = end
+                continue
+            before = "".join(out).rstrip()[-1:]
+            if c == "(" and not (before and (before.isalnum() or before in "_.)]")):  # a group, not f(...)
+                end = scan_balanced(code, j)
+                inner = code[j + 1:end - 1]
+                if self.is_command(tokenize(inner)):
+                    name = f"__group{len(ns)}"
+                    ns[name] = self.evaluate(inner)
+                    out.append(name)
+                    j = end
+                    continue
+            out.append(c)
+            j += 1
+        return "".join(out)
+
+    def _interpolate(self, text, keep_underscore=False):
+        """Expand $name and $(expression) inside a double-quoted string."""
+        out, j = [], 0
+        while j < len(text):
+            if text.startswith("$(", j):
+                end = scan_balanced(text, j + 1)
+                items = _iterate(self.evaluate(text[j + 2:end - 1]))
+                out.append(" ".join(str(x) for x in items))
+                j = end
+                continue
+            m = re.match(r"\$(\w+)", text[j:])
+            if m and not (keep_underscore and m.group(1) == "_"):
+                out.append(str(_none_to_empty(self.vars.get(m.group(1).lower()))))
+                j += m.end()
+                continue
+            out.append(text[j])
+            j += 1
+        return "".join(out)
+
+    def is_command(self, tokens):
+        """Does this statement start with a command (vs. a value like 5, "text", $x or (expr))?"""
+        if not tokens or tokens[0][0] != "word":
+            return False
+        word = tokens[0][1]
+        # a call like math.sqrt(...) or len(...) is a Python expression, not a command
+        return not re.match(r"[$\d\[@!]|-\w|-?\.?\d", word) and "(" not in word
+
+    def evaluate(self, text):
+        """Value of a condition / right-hand side: run it if it is a command, else evaluate it."""
+        tokens = tokenize(text)
+        if self.is_command(tokens) or (tokens and ("op", "|") in tokens):
+            items = self.run_pipeline(tokens, capture=True)
+            return items[0] if len(items) == 1 else PSList(items)
+        return self.eval_expr(text)
+
+    def run_block(self, code, item=None):
+        """Run a { script block } with $_ set; returns what it outputs (used by where / foreach)."""
+        saved = self.vars.get("_")
+        self.vars["_"] = item
+        try:
+            return self.capture(lambda: self.run_script(code))
+        finally:
+            self.vars["_"] = saved
+
+    def capture(self, fn):
+        self.sinks.append([])
+        try:
+            fn()
+        finally:
+            items = self.sinks.pop()
+        return items
+
+    def emit(self, items):
+        if self.sinks:
+            self.sinks[-1].extend(items)
+        else:
+            output(items)
 
     @staticmethod
     def parse_args(args):
@@ -215,34 +578,139 @@ class Shell:
     # ---- execution
 
     def run_line(self, line):
-        line = line.lstrip(chr(0xFEFF))  # BOM from piped input / Notepad files
-        for stmt in split_on(tokenize(line), ";"):
-            if not stmt:
-                continue
-            if len(stmt) >= 3 and stmt[0][0] == "word" and stmt[0][1].startswith("$") and stmt[1] == ("op", "="):
-                result = self.run_pipeline(stmt[2:], capture=True)
-                self.vars[stmt[0][1][1:].lower()] = result[0] if len(result) == 1 else result
-            else:
-                output(self.run_pipeline(stmt))
+        try:
+            self.run_script(line.lstrip(chr(0xFEFF)))  # BOM from piped input / Notepad files
+        except ReturnSignal as r:  # `return` in a script file just ends it
+            self.emit(r.items)
+        except (BreakSignal, ContinueSignal):
+            raise ShellError("break/continue can only be used inside a loop")
+
+    def run_script(self, text):
+        stmts = self._parsed.get(text)
+        if stmts is None:
+            stmts = self._parsed[text] = ScriptParser(text).statements()
+        for stmt in stmts:
+            if not self.running:
+                return
+            self.exec_stmt(stmt)
+
+    def exec_stmt(self, stmt):
+        kind = stmt[0]
+        if kind == "simple":
+            self.run_simple(stmt[1])
+        elif kind == "if":
+            for cond, body in stmt[1]:
+                if _truthy(self.evaluate(cond)):
+                    return self.run_script(body)
+            if stmt[2] is not None:
+                self.run_script(stmt[2])
+        elif kind == "foreach":
+            _, var, source, body = stmt
+            for item in _iterate(self.evaluate(source)):
+                self.vars[var] = item
+                if self._loop_body(body):
+                    break
+        elif kind == "while":
+            while _truthy(self.evaluate(stmt[1])):
+                if self._loop_body(stmt[2]):
+                    break
+        elif kind == "for":
+            _, init, cond, step, body = stmt
+            if init:
+                self.run_simple(init)
+            while not cond or _truthy(self.evaluate(cond)):
+                if self._loop_body(body):
+                    break
+                if step:
+                    self.run_simple(step)
+        elif kind == "function":
+            _, key, name, params, body = stmt
+            self.functions[key] = (name, params, body)
+        elif kind == "return":
+            items = []
+            if stmt[1]:
+                items = _iterate(self.evaluate(stmt[1]))
+            raise ReturnSignal(items)
+        elif kind == "break":
+            raise BreakSignal()
+        elif kind == "continue":
+            raise ContinueSignal()
+
+    def _loop_body(self, body):
+        """Run one loop iteration; True means `break`."""
+        if not self.running:  # `exit` inside a loop
+            return True
+        try:
+            self.run_script(body)
+        except BreakSignal:
+            return True
+        except ContinueSignal:
+            pass
+        return False
+
+    def run_simple(self, text):
+        m = re.fullmatch(r"\$(\w+)\s*(\+\+|--)", text)
+        if m:
+            name = m.group(1).lower()
+            self.vars[name] = (self.vars.get(name) or 0) + (1 if m.group(2) == "++" else -1)
+            return
+        m = re.fullmatch(r"\$(\w+)\s*([-+*/]?)=(?!=)\s*(.+)", text, re.S)
+        if m:
+            name, op, rhs = m.group(1).lower(), m.group(2), m.group(3)
+            value = self.evaluate(rhs)
+            if op:
+                current = self.vars.get(name)
+                value = {"+": lambda a, b: a + b, "-": lambda a, b: a - b,
+                         "*": lambda a, b: a * b, "/": lambda a, b: a / b}[op](current, value)
+            self.vars[name] = value
+            return
+        self.emit(self.run_pipeline(tokenize(text), capture=bool(self.sinks)))
 
     def run_pipeline(self, tokens, capture=False):
         stages = split_on(tokens, "|")
-        if len(stages) == 1 and stages[0] and stages[0][0][0] != "word":
-            return [self.value(stages[0][0])]
-        if len(stages) == 1 and stages[0] and stages[0][0][1].startswith("$"):
-            v = self.value(stages[0][0])
-            return v if isinstance(v, list) else [v]
         data = None
         for i, stage in enumerate(stages):
             if not stage:
                 raise ShellError("empty pipeline element")
+            if i == 0 and not self.is_command(stage):
+                data = to_items(self.eval_expr(tokens_to_text(stage)))
+                continue
             name = stage[0][1]
             args = [self.value(t) for t in stage[1:]]
             live = not capture and i == len(stages) - 1
             data = self.invoke(name, args, data, live)
         return data or []
 
+    def call_function(self, key, args, pipe):
+        name, params, body = self.functions[key]
+        pos, named = self.parse_args(args)
+        outer = self.vars
+        self.vars = dict(outer)  # function scope: sees the caller's variables, its own changes stay local
+        try:
+            for pname, default in params:
+                if pname in named:
+                    self.vars[pname] = named.pop(pname)
+                elif pos:
+                    self.vars[pname] = pos.pop(0)
+                else:
+                    self.vars[pname] = self.evaluate(default) if default else None
+            self.vars["args"] = pos
+            self.vars["input"] = list(pipe or [])
+            self.sinks.append([])  # everything the body outputs is the function's result
+            returned = []
+            try:
+                self.run_script(body)
+            except ReturnSignal as r:
+                returned = r.items
+            finally:
+                items = self.sinks.pop()
+            return items + list(returned)
+        finally:
+            self.vars = outer
+
     def invoke(self, name, args, pipe, live=False):
+        if name.lower() in self.functions:
+            return self.call_function(name.lower(), args, pipe)
         key = self.aliases.get(name.lower(), name.lower())
         if key in self.commands:
             pos, named = self.parse_args(args)
@@ -290,7 +758,12 @@ class Shell:
 
     def where_object(self, pos, named, pipe):
         if pos and isinstance(pos[0], tuple):
-            return [x for x in pipe if self.eval_block(pos[0][1], x)]
+            def keep(x):
+                try:
+                    return _truthy(self.run_block(pos[0][1], x))
+                except TypeError:  # e.g. folder Length (None) -gt 100: treat as no match, like PowerShell
+                    return False
+            return [x for x in pipe if keep(x)]
         # Where-Object Prop -gt Value
         if not pos:
             raise ShellError("Where-Object needs a condition")
@@ -338,7 +811,7 @@ class Shell:
         if not pos or not isinstance(pos[0], tuple):
             raise ShellError("ForEach-Object needs a { script block }")
         for x in pipe:
-            yield self.eval_block(pos[0][1], x)
+            yield from self.run_block(pos[0][1], x)
 
     def write_output(self, pos, named, pipe):
         return list(pipe) + [p for p in pos]
@@ -458,6 +931,24 @@ class Shell:
     def get_history(self, pos, named, pipe):
         for i, line in enumerate(self.history, 1):
             yield Obj(Id=i, CommandLine=line)
+
+    def test_path(self, pos, named, pipe):
+        return [all(os.path.exists(str(p)) for p in pos)] if pos else [False]
+
+    def read_host(self, pos, named, pipe):
+        try:
+            return [input(f"{' '.join(str(p) for p in pos)}: " if pos else "")]
+        except EOFError:
+            return [""]
+
+    def start_sleep(self, pos, named, pipe):
+        seconds = float(named.get("seconds", pos[0] if pos else 1))
+        time.sleep(float(named["milliseconds"]) / 1000 if "milliseconds" in named else seconds)
+        return []
+
+    def get_function(self, pos, named, pipe):
+        for name, params, body in self.functions.values():
+            yield Obj(Name=name, Parameters=", ".join("$" + p for p, _ in params))
 
     # ---- Python integration
 
@@ -710,6 +1201,37 @@ def _sort_key(v):
     return (2, str(v).lower())
 
 
+class PSList(list):
+    """Command results: a normal Python list that also has PowerShell's .Count / .Length."""
+
+    @property
+    def Count(self):
+        return len(self)
+
+    Length = Count
+
+
+def _truthy(value):
+    if isinstance(value, list):
+        return bool(value[0]) if len(value) == 1 else bool(value)
+    return bool(value)
+
+
+def _iterate(value):
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, dict, Obj)):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _none_to_empty(value):
+    return "" if value is None else value
+
+
 def _auto_type(text):
     """CSV/ssh values arrive as text; turn numbers into numbers so -gt and sum() work."""
     if not isinstance(text, str):
@@ -908,8 +1430,16 @@ def main():
     shell = Shell()
     if len(sys.argv) > 1:
         with open(sys.argv[1], encoding="utf-8-sig") as f:
-            for line in f:
-                shell.run_line(line)
+            script = f.read()
+        shell.vars["args"] = sys.argv[2:]
+        try:
+            shell.run_line(script)
+        except ShellError as e:
+            print(f"{RED}{e}{RESET}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"{RED}{type(e).__name__}: {e}{RESET}")
+            sys.exit(1)
         return
     print(f"{CHERRY}CherryShell {__version__}{RESET} - type Get-Command for commands, exit to quit.\n")
     read_line = make_reader(shell)
@@ -921,12 +1451,22 @@ def main():
         except EOFError:
             print()
             break
+        try:
+            while is_incomplete(line):  # an open { or ( : keep reading the block
+                line += "\n" + read_line(">> ")
+        except KeyboardInterrupt:
+            print()
+            continue
+        except EOFError:
+            pass
         if line.strip():
             shell.history.append(line.strip())
         try:
             shell.run_line(line)
         except ShellError as e:
             print(f"{RED}{e}{RESET}")
+        except KeyboardInterrupt:
+            print(f"{RED}Stopped.{RESET}")
         except Exception as e:
             print(f"{RED}{type(e).__name__}: {e}{RESET}")
 
