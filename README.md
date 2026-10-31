@@ -9,6 +9,37 @@ gci | ? { $_.Length -gt 100 } | measure Length
 $x = "cherry"; echo "hello $x"
 ```
 
+## Python in the pipeline
+
+CherryShell runs on Python, so Python is part of the shell. `py` evaluates an expression where `_` is the list of pipeline items (or one item at a time with `-Each`). Modules like `math`, `json` or `statistics` are imported automatically.
+
+```
+ls | py "sum(x.Length or 0 for x in _)"
+cat data.csv | from-csv | where Price -gt 100
+from-csv data.csv | py "statistics.mean(x.Price for x in _)"
+ls | py -Each "_.Name.upper()"
+get-json https://api.github.com/repos/suchit-prajapati/CherryShell | select name,stargazers_count
+py "a = 21"; py "a * 2"
+```
+
+Also: `to-csv`, `from-json`, `to-json` (pass a file name to read from or write to a file). The installer bundles common standard-library modules; to use pip packages such as `requests` or `pandas`, run CherryShell from source with `python cherryshell.py`.
+
+## Server manager
+
+Save servers once, then connect by name or run a command on all of them in parallel. Uses the OpenSSH client that ships with Windows.
+
+```
+Add-Server web1 deploy@203.0.113.10 -Tags web,prod
+Add-Server db1 admin@203.0.113.20 -Port 2222 -Key ~/.ssh/id_ed25519 -Tags db
+servers                                 # list saved servers
+connect web1                            # interactive SSH session
+Invoke-Server "uptime" -Tag web         # run on every web server at once
+Invoke-Server "df -h /" | where Output -like *9?%*
+server-status -Detailed                 # online/offline, ping, load, memory, disk
+```
+
+`Invoke-Server` and `server-status -Detailed` need key-based SSH login (no password prompts). Servers are stored in `~/.cherryshell/servers.json`.
+
 ## Install
 
 Download `CherryShell-Setup.exe` from the [latest release](https://github.com/suchit-prajapati/CherryShell/releases/latest) and run it.

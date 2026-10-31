@@ -1,12 +1,22 @@
 """CherryShell - a small PowerShell-style shell with an object pipeline."""
-__version__ = "0.2"
+__version__ = "0.3"
 
+import ast
+import csv
 import glob
+import importlib
+import io
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 
@@ -17,10 +27,15 @@ class Obj:
         self.__dict__["_props"] = dict(props)
 
     def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
         for k, v in self._props.items():
             if k.lower() == name.lower():
                 return v
         return None
+
+    def __getitem__(self, name):  # lets `py` code use x["Name"] as well as x.Name
+        return getattr(self, name)
 
     def __setattr__(self, name, value):
         self._props[name] = value
@@ -113,6 +128,15 @@ class Shell:
             "exit": self.exit, "new-item": self.new_item, "remove-item": self.remove_item,
             "copy-item": self.copy_item, "move-item": self.move_item,
             "rename-item": self.rename_item, "get-history": self.get_history,
+            # Python integration
+            "invoke-python": self.invoke_python,
+            "convertfrom-csv": self.convertfrom_csv, "convertto-csv": self.convertto_csv,
+            "convertfrom-json": self.convertfrom_json, "convertto-json": self.convertto_json,
+            "invoke-restmethod": self.invoke_restmethod,
+            # Server manager
+            "add-server": self.add_server, "remove-server": self.remove_server,
+            "get-server": self.get_server, "connect-server": self.connect_server,
+            "invoke-server": self.invoke_server, "get-serverstatus": self.get_serverstatus,
         }
         self.aliases = {
             "ls": "get-childitem", "dir": "get-childitem", "gci": "get-childitem",
@@ -127,12 +151,19 @@ class Shell:
             "mv": "move-item", "move": "move-item", "mi": "move-item",
             "ren": "rename-item", "rni": "rename-item",
             "history": "get-history", "h": "get-history",
+            "py": "invoke-python", "from-csv": "convertfrom-csv", "to-csv": "convertto-csv",
+            "from-json": "convertfrom-json", "to-json": "convertto-json",
+            "get-json": "invoke-restmethod", "irm": "invoke-restmethod",
+            "servers": "get-server", "connect": "connect-server",
+            "on-servers": "invoke-server", "server-status": "get-serverstatus",
         }
+        self.py_ns = {}  # persists between `py` calls, so `py "a = 5"` then `py "a * 2"` works
 
     # ---- evaluation helpers
 
     def expand(self, text):
-        return re.sub(r"\$(\w+)", lambda m: str(self.vars.get(m.group(1).lower(), "")), text)
+        # $_ is left alone so it can reach script blocks and `py` code
+        return re.sub(r"\$(?!_\b)(\w+)", lambda m: str(self.vars.get(m.group(1).lower(), "")), text)
 
     def value(self, tok):
         kind, text = tok
@@ -428,6 +459,220 @@ class Shell:
         for i, line in enumerate(self.history, 1):
             yield Obj(Id=i, CommandLine=line)
 
+    # ---- Python integration
+
+    def invoke_python(self, pos, named, pipe):
+        """py "expr" - `_` is the list of pipeline items; with -Each, `_` is one item at a time."""
+        each = named.get("each")
+        code = each if isinstance(each, str) else " ".join(str(p) for p in pos)
+        if not code.strip():
+            raise ShellError('usage: py "<python expression>"   (pipeline input is `_`)')
+        code = re.sub(r"\$_\b", "_", code)
+        ns = self.py_ns
+        ns.update({k: v for k, v in self.vars.items() if k.isidentifier()})
+        try:
+            compiled = compile(code, "<py>", "eval")
+        except SyntaxError:
+            _auto_import(code, ns, "exec")
+            exec(compile(code, "<py>", "exec"), ns)
+            return []
+        _auto_import(code, ns, "eval")
+        if each:
+            out = []
+            for item in pipe:
+                ns["_"] = item
+                out.extend(to_items(eval(compiled, ns)))
+            return out
+        ns["_"] = list(pipe)
+        return to_items(eval(compiled, ns))
+
+    def _read_text(self, pos, pipe):
+        if pos:
+            with open(pos[0], encoding="utf-8-sig", errors="replace") as f:
+                return f.read()
+        return "\n".join(str(x) for x in pipe)
+
+    def _write_or_return(self, pos, lines):
+        if pos:
+            with open(pos[0], "w", encoding="utf-8", newline="") as f:
+                f.write("\n".join(lines) + "\n")
+            return []
+        return lines
+
+    def convertfrom_csv(self, pos, named, pipe):
+        for row in csv.DictReader(io.StringIO(self._read_text(pos, pipe))):
+            yield Obj(**{k: _auto_type(v) for k, v in row.items() if k is not None})
+
+    def convertto_csv(self, pos, named, pipe):
+        rows = [to_plain(x) for x in pipe]
+        cols = []
+        for r in rows:
+            for k in (r if isinstance(r, dict) else {"Value": r}):
+                if k not in cols:
+                    cols.append(k)
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        writer.writerow(cols)
+        for r in rows:
+            r = r if isinstance(r, dict) else {"Value": r}
+            writer.writerow(["" if r.get(c) is None else r.get(c) for c in cols])
+        return self._write_or_return(pos, buf.getvalue().splitlines())
+
+    def convertfrom_json(self, pos, named, pipe):
+        return to_items(json.loads(self._read_text(pos, pipe)))
+
+    def convertto_json(self, pos, named, pipe):
+        items = [to_plain(x) for x in pipe]
+        data = items[0] if len(items) == 1 else items
+        return self._write_or_return(pos, json.dumps(data, indent=2, default=str).splitlines())
+
+    def invoke_restmethod(self, pos, named, pipe):
+        url = named.get("uri", pos[0] if pos else None)
+        if not url:
+            raise ShellError("usage: get-json <url> [-Method POST] [-Body '{...}']")
+        body = named.get("body")
+        if body is not None and not isinstance(body, (str, bytes)):
+            body = json.dumps(to_plain(body))
+        req = urllib.request.Request(
+            str(url), method=str(named.get("method", "POST" if body else "GET")).upper(),
+            data=body.encode() if isinstance(body, str) else body,
+            headers={"User-Agent": f"CherryShell/{__version__}", "Accept": "application/json",
+                     **({"Content-Type": "application/json"} if body else {})})
+        try:
+            with urllib.request.urlopen(req, timeout=float(named.get("timeout", 30))) as resp:
+                text = resp.read().decode(resp.headers.get_content_charset() or "utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raise ShellError(f"HTTP {e.code} {e.reason} for {url}")
+        except urllib.error.URLError as e:
+            raise ShellError(f"Could not reach {url}: {e.reason}")
+        try:
+            return to_items(json.loads(text))
+        except ValueError:
+            return text.splitlines()
+
+    # ---- server manager
+
+    def _pick_servers(self, pos, named, pipe):
+        servers = load_servers()
+        names = [get_prop(x, "Name") for x in pipe if get_prop(x, "Name")]
+        for p in pos:
+            names.extend(n for n in str(p).split(",") if n)
+        if "name" in named:
+            names.extend(n for n in str(named["name"]).split(",") if n)
+        picked = list(servers) if not names else []
+        for n in names:
+            matches = [s for s in servers if _like(s, n)]
+            if not matches:
+                raise ShellError(f"No server named '{n}'. See: Get-Server")
+            picked.extend(m for m in matches if m not in picked)
+        if "tag" in named:
+            picked = [s for s in picked if str(named["tag"]).lower() in servers[s]["tags"]]
+        return [(s, servers[s]) for s in picked]
+
+    def add_server(self, pos, named, pipe):
+        if len(pos) < 2:
+            raise ShellError("usage: Add-Server <name> <user@host> [-Port 22] [-Key path] [-Tags web,db]")
+        name, target = str(pos[0]), str(pos[1])
+        user, _, host = target.rpartition("@")
+        user = named.get("user", user) or os.environ.get("USERNAME") or os.environ.get("USER", "")
+        servers = load_servers()
+        servers[name] = {
+            "host": host, "user": str(user), "port": int(named.get("port", 22)),
+            "key": os.path.abspath(os.path.expanduser(str(named["key"]))) if "key" in named else "",
+            "tags": [t.strip().lower() for t in str(named.get("tags", "")).split(",") if t.strip()],
+        }
+        save_servers(servers)
+        return [server_obj(name, servers[name])]
+
+    def remove_server(self, pos, named, pipe):
+        servers = load_servers()
+        for name, _ in self._pick_servers(pos, named, pipe) if (pos or pipe or named) else []:
+            del servers[name]
+        save_servers(servers)
+        return []
+
+    def get_server(self, pos, named, pipe):
+        servers = load_servers()
+        if pos or named:
+            return [server_obj(n, s) for n, s in self._pick_servers(pos, named, pipe)]
+        return [server_obj(n, s) for n, s in servers.items()]
+
+    def connect_server(self, pos, named, pipe):
+        picked = self._pick_servers(pos[:1], {}, [])
+        if not pos or len(picked) != 1:
+            raise ShellError("usage: Connect-Server <name>")
+        _, srv = picked[0]
+        try:
+            subprocess.run(ssh_argv(srv) + [str(p) for p in pos[1:]])
+        except FileNotFoundError:
+            raise ShellError("ssh was not found. Install the Windows OpenSSH Client.")
+        except KeyboardInterrupt:
+            print()
+        return []
+
+    def invoke_server(self, pos, named, pipe):
+        """Run one command on many servers in parallel: Invoke-Server "uptime" [-Name a,b] [-Tag web]"""
+        if not pos:
+            raise ShellError('usage: Invoke-Server "<command>" [-Name web1,web2] [-Tag web]')
+        command = str(pos[0])
+        picked = self._pick_servers(pos[1:], named, pipe)
+        if not picked:
+            raise ShellError("No servers saved yet. Add one with: Add-Server <name> <user@host>")
+        timeout = float(named.get("timeout", 60))
+
+        def run(srv):
+            try:
+                p = subprocess.run(ssh_argv(srv, batch=True) + [command], capture_output=True, text=True,
+                                   errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return [], [f"timed out after {timeout:g}s"], None
+            except FileNotFoundError:
+                return [], ["ssh was not found. Install the Windows OpenSSH Client."], None
+            return p.stdout.splitlines(), p.stderr.splitlines(), p.returncode
+
+        with ThreadPoolExecutor(max_workers=min(16, len(picked))) as pool:
+            results = list(pool.map(lambda ns: run(ns[1]), picked))
+        for (name, _), (out, err, code) in zip(picked, results):
+            for line in out:
+                yield Obj(Server=name, Output=line)
+            for line in err:
+                yield Obj(Server=name, Output="! " + line)
+            if code:
+                yield Obj(Server=name, Output=f"! exit code {code}")
+
+    def get_serverstatus(self, pos, named, pipe):
+        """Reachability and latency for each server; -Detailed also logs in for load, memory and disk."""
+        picked = self._pick_servers(pos, named, pipe)
+        detailed = bool(named.get("detailed"))
+
+        def check(srv):
+            row = {"Status": "Offline", "PingMs": None}
+            start = time.perf_counter()
+            try:
+                socket.create_connection((srv["host"], srv["port"]), timeout=3).close()
+                row.update(Status="Online", PingMs=round((time.perf_counter() - start) * 1000))
+            except OSError:
+                return row
+            if detailed:
+                row.update(Load=None, MemUsed=None, DiskUsed=None)
+                try:
+                    p = subprocess.run(ssh_argv(srv, batch=True) + [STATUS_COMMAND], capture_output=True,
+                                       text=True, errors="replace", stdin=subprocess.DEVNULL, timeout=20)
+                    vals = p.stdout.split()
+                    if p.returncode == 0 and len(vals) >= 3:
+                        row.update(Load=_auto_type(vals[0]), MemUsed=vals[1] + "%", DiskUsed=vals[2])
+                    else:
+                        row["Status"] = "Online (login failed)"
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    row["Status"] = "Online (login failed)"
+            return row
+
+        if not picked:
+            return []
+        with ThreadPoolExecutor(max_workers=min(16, len(picked))) as pool:
+            rows = list(pool.map(lambda ns: check(ns[1]), picked))
+        return [Obj(Name=name, Host=srv["host"], **row) for (name, srv), row in zip(picked, rows)]
+
 
 class ShellError(Exception):
     pass
@@ -435,7 +680,8 @@ class ShellError(Exception):
 
 # --------------------------------------------------------------- helpers
 
-_WORDS = {"childitem": "ChildItem", "foreach": "ForEach"}
+_WORDS = {"childitem": "ChildItem", "foreach": "ForEach", "convertfrom": "ConvertFrom",
+          "convertto": "ConvertTo", "restmethod": "RestMethod", "serverstatus": "ServerStatus"}
 
 
 def _title(name):
@@ -462,6 +708,113 @@ def _sort_key(v):
     if isinstance(v, (int, float)):
         return (1, v)
     return (2, str(v).lower())
+
+
+def _auto_type(text):
+    """CSV/ssh values arrive as text; turn numbers into numbers so -gt and sum() work."""
+    if not isinstance(text, str):
+        return text
+    for cast in (int, float):
+        try:
+            return cast(text)
+        except ValueError:
+            pass
+    return text
+
+
+def to_obj(value):
+    return Obj(**{str(k): v for k, v in value.items()}) if isinstance(value, dict) else value
+
+
+def to_items(result):
+    """Turn a Python value into pipeline items: lists/iterables spread out, dicts become objects."""
+    if result is None:
+        return []
+    if isinstance(result, (str, bytes, int, float, bool, dict, Obj)):
+        return [to_obj(result)]
+    try:
+        return [to_obj(x) for x in result]
+    except TypeError:
+        return [result]
+
+
+def to_plain(value):
+    if isinstance(value, Obj):
+        return {k: to_plain(v) for k, v in value._props.items()}
+    if isinstance(value, dict):
+        return {k: to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_plain(v) for v in value]
+    return value
+
+
+def _auto_import(code, ns, mode):
+    """Import modules that `py` code mentions (math, json, urllib.request, ...) without an import line."""
+    try:
+        tree = ast.parse(code, mode=mode)
+    except SyntaxError:
+        return
+    # names the code binds itself (loop/comprehension variables, lambda args) are not modules
+    bound = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)}
+    bound |= {a.arg for a in ast.walk(tree) if isinstance(a, ast.arg)}
+    for node in ast.walk(tree):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.insert(0, node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name) or node.id in ns or node.id in bound \
+                or hasattr(__builtins__, node.id) \
+                or (isinstance(__builtins__, dict) and node.id in __builtins__):
+            continue
+        parts.insert(0, node.id)
+        for i in range(len(parts), 0, -1):
+            try:
+                importlib.import_module(".".join(parts[:i]))
+            except ImportError:
+                continue
+            ns[node.id] = importlib.import_module(node.id)
+            break
+
+
+# ---- server manager storage
+
+STATUS_COMMAND = ("cut -d' ' -f1 /proc/loadavg; "
+                  "free | awk '/Mem:/ {printf \"%.0f\\n\", $3/$2*100}'; "
+                  "df -P / | awk 'NR==2 {print $5}'")
+
+
+def servers_file():
+    home = os.environ.get("CHERRYSHELL_HOME") or os.path.join(os.path.expanduser("~"), ".cherryshell")
+    return os.path.join(home, "servers.json")
+
+
+def load_servers():
+    try:
+        with open(servers_file(), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_servers(servers):
+    path = servers_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(servers, f, indent=2)
+
+
+def server_obj(name, srv):
+    return Obj(Name=name, User=srv["user"], Host=srv["host"], Port=srv["port"],
+               Tags=", ".join(srv["tags"]), Key=srv["key"])
+
+
+def ssh_argv(srv, batch=False):
+    argv = ["ssh", "-p", str(srv["port"])]
+    if srv["key"]:
+        argv += ["-i", srv["key"]]
+    if batch:  # never stop to ask for a password or host-key confirmation when running on many servers
+        argv += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
+    return argv + [f"{srv['user']}@{srv['host']}" if srv["user"] else srv["host"]]
 
 
 def format_lines(items):
